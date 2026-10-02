@@ -7185,7 +7185,16 @@ function neutralizeAgentReferences(content, instructionFile) {
   return c;
 }
 
-function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOverride = null } = {}) {
+// #4779: whole-content Claude→OpenCode body rewrites shared by
+// convertClaudeToOpencodeFrontmatter and the post-install opencode rewrite
+// pass below. Runs on the full file text (frontmatter lines included) —
+// frontmatter STRUCTURE surgery (name:/tools:/mode:) stays in the converter
+// only, so re-applying this to already-converted output is idempotent.
+// DEFECT.GENERATIVE-FIX: this body is mirrored in
+// src/runtime-artifact-conversion.cts's applyOpencodeBodyRewrites. Neither
+// copy re-exports the other — mirror any behavior change into both. Guarded
+// by the output-parity test in tests/runtime-converters.test.cjs (#4779).
+function applyOpencodeBodyRewrites(content) {
   // Replace tool name references in content (applies to all files)
   let convertedContent = filterRuntimeNotesForTarget(content, 'opencode');
   convertedContent = convertedContent.replace(/\bAskUserQuestion\b/g, 'question');
@@ -7193,13 +7202,41 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOve
   convertedContent = convertedContent.replace(/\bTodoWrite\b/g, 'todowrite');
   // Replace /gsd-command colon variant with /gsd-command for opencode (flat command structure)
   convertedContent = convertedContent.replace(/\/gsd:/g, '/gsd-');
-  // Replace ~/.claude and $HOME/.claude with OpenCode's config location
-  convertedContent = convertedContent.replace(/~\/\.claude\b/g, '~/.config/opencode');
-  convertedContent = convertedContent.replace(/\$HOME\/\.claude\b/g, '$HOME/.config/opencode');
+  // Replace ~/.claude and $HOME/.claude with OpenCode's config location.
+  // The (?<!:-) guard keeps `${VAR:-$HOME/.claude}` shell-default fallbacks
+  // (the ordered multi-runtime fallback chain, e.g.
+  // `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`) byte-identical — without it the
+  // \b matches before `}` and the fallback default gets mangled.
+  convertedContent = convertedContent.replace(/(?<!:-)~\/\.claude\b/g, '~/.config/opencode');
+  convertedContent = convertedContent.replace(/(?<!:-)\$HOME\/\.claude\b/g, '$HOME/.config/opencode');
+  // #4779 owned refs: launcher hint names the invoking runtime flag with the
+  // scope flag preserved (never hardcode --global: --local installs carry
+  // `--claude --local`). Bare reviewer flags (`--claude` without a scope)
+  // are a different surface and stay untouched.
+  convertedContent = convertedContent.replace(/--claude (--(?:local|global))/g, '--opencode $1');
+  // #4779 owned refs: skill locator → opencode skills dir. Pattern-specific
+  // (skills/ only — `.claude/worktrees/` worktree dirs and the fallback chain
+  // carry no `.claude/skills/` occurrence, so this blanket form is safe).
+  convertedContent = convertedContent.replace(/\.claude\/skills\//g, '.opencode/skills/');
+  // #4779 owned refs: ./-anchored tree refs (skill outputs, @-includes) →
+  // opencode tree. `${_GSD_RUNTIME_ROOT}/.claude/` fallbacks contain `/.claude/`,
+  // never `./.claude/`, so they survive.
+  convertedContent = convertedContent.replace(/\.\/\.claude\//g, './.opencode/');
   // Replace general-purpose subagent type with OpenCode's equivalent "general"
   convertedContent = convertedContent.replace(/subagent_type="general-purpose"/g, 'subagent_type="general"');
   // Runtime-neutral agent name replacement (#766)
   convertedContent = neutralizeAgentReferences(convertedContent, 'AGENTS.md');
+  return convertedContent;
+}
+
+function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOverride = null } = {}) {
+  // DEFECT.GENERATIVE-FIX: this body is mirrored in
+  // src/runtime-artifact-conversion.cts's convertClaudeToOpencodeFrontmatter
+  // (used by src/install-engine.cts's combined-family install path). Neither
+  // copy re-exports the other — mirror any behavior change into both.
+  // Guarded by the output-parity test in
+  // tests/runtime-converters.test.cjs (#4779).
+  const convertedContent = applyOpencodeBodyRewrites(content);
 
   // The frontmatter block, as the one fence owner finds it (none → nothing to convert).
   const { frontmatter, body } = extractFrontmatterAndBody(convertedContent);
@@ -12330,6 +12367,42 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
           }
         }
       }
+      // #4779: opencode post-install rewrite pass. Several emitters bypass
+      // the per-runtime converters — the Runtime Surface corpus
+      // (gsd-core/agents/, gsd-core/commands/gsd/) is a verbatim cpSync of
+      // the Claude-canonical source by design (it re-materializes the
+      // surface after the package tree disappears) — so converter-level
+      // rules alone cannot reach every owned ref. This runs after all .md
+      // emitters and before the scan below, which stays as the verification
+      // backstop. Body rewrites only (no frontmatter surgery), idempotent,
+      // fallback-chain safe via the same (?<!:-) guard the converter uses —
+      // `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` defaults,
+      // `${_GSD_RUNTIME_ROOT}/.claude/` probes, and CHANGELOG.md are
+      // deliberately untouched.
+      let opencodeRewroteFiles = 0;
+      if (runtime === 'opencode') {
+        for (const relPath of manifestFiles) {
+          const fileName = path.basename(relPath);
+          if (!(fileName.endsWith('.md') || fileName.endsWith('.toml'))) continue;
+          if (fileName === 'CHANGELOG.md') continue;
+          const rewritePath = path.join(targetDir, relPath);
+          let rewriteContent;
+          try {
+            rewriteContent = fs.readFileSync(rewritePath, 'utf8');
+          } catch (rewriteErr) {
+            continue; // inaccessible or missing — the scan below reports or skips it
+          }
+          const rewritten = applyOpencodeBodyRewrites(rewriteContent);
+          if (rewritten !== rewriteContent) {
+            try {
+              fs.writeFileSync(rewritePath, rewritten);
+              opencodeRewroteFiles += 1;
+            } catch (writeErr) {
+              continue; // never fail the install over the rewrite; the scan still warns
+            }
+          }
+        }
+      }
       for (const relPath of manifestFiles) {
         const fileName = path.basename(relPath);
         if (!(fileName.endsWith('.md') || fileName.endsWith('.toml'))) continue;
@@ -12344,10 +12417,24 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
           }
           throw err;
         }
-        const matches = content.match(/(?:~|\$HOME)\/\.claude\b/g);
+        // #4779: the opencode scan covers exactly the converter's owned set
+        // (launcher hints, skill locators, @-includes, ./-anchored and
+        // ~/$HOME-anchored refs) with the same (?<!:-) fallback guard, so
+        // surviving `${VAR:-…}` shell defaults never trip it. Other runtimes
+        // keep the legacy pattern (their conversions are out of scope here).
+        const leakRe = runtime === 'opencode'
+          ? /--claude --(?:local|global)|\.claude\/skills\/|@(?:~|\$HOME|\.)\/\.claude\/|\.\/\.claude\/|(?<!:-)(?:~|\$HOME)\/\.claude\b/g
+          : /(?:~|\$HOME)\/\.claude\b/g;
+        const matches = content.match(leakRe);
         if (matches) {
           leakedPaths.push({ file: relPath, count: matches.length });
         }
+      }
+      // The post-install rewrite above changed bytes after writeManifest
+      // hashed them — re-hash so the manifest stays self-consistent (same
+      // pattern as the cline/windsurf post-write passes).
+      if (opencodeRewroteFiles > 0) {
+        writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
       }
     }
     if (leakedPaths.length > 0) {

@@ -350,6 +350,28 @@ describe('convertClaudeToOpencodeFrontmatter output parity: bin/install.js vs ru
       convertViaConversionModule(input),
     );
   });
+
+  // #4779: the #4779 owned-ref rules (hint, locator, @-include, fallback
+  // guard) must behave identically in both twins — the installed-tree scan
+  // tests exercise the module copy through the engine, the unit tests above
+  // exercise the bin/install.js copy directly.
+  test('identical output for #4779 owned refs (agent and command modes)', () => {
+    const probe = (body) => ['---', 'name: gsd-probe', 'description: probe', '---', '', body].join('\n');
+    const bodies = [
+      'Check .claude/skills/ then run npx -y @opengsd/gsd-core@latest --claude --local.',
+      'SKILL=$(ls ./.claude/skills/sketch-findings-demo/SKILL.md 2>/dev/null | head -1 || true)',
+      'Invoke `@./.claude/gsd-core/workflows/node-repair.md` next, see "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/gsd-tools.cjs".',
+    ];
+    for (const isAgent of [false, true]) {
+      for (const body of bodies) {
+        assert.equal(
+          convertClaudeToOpencodeFrontmatter(probe(body), { isAgent }),
+          convertViaConversionModule(probe(body), { isAgent }),
+          `twins must agree (isAgent: ${isAgent}): ${body.slice(0, 60)}`,
+        );
+      }
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2915,6 +2937,20 @@ describe('converters read the frontmatter block the one fence owner finds', () =
         const hasConfigDirFallback = files.some((f) => fs4779.readFileSync(f, 'utf8').includes('CLAUDE_CONFIG_DIR'));
         assert4779.ok(hasRuntimeRootFallback, 'expected ${_GSD_RUNTIME_ROOT}/.claude fallbacks to survive the install');
         assert4779.ok(hasConfigDirFallback, 'expected CLAUDE_CONFIG_DIR fallbacks to survive the install');
+        // #4779 fallback-aware guard: the `${VAR:-default}` shell default must
+        // survive byte-identical — the pre-fix `$HOME/.claude` rule mangled it
+        // into `${CLAUDE_CONFIG_DIR:-$HOME/.config/opencode}` in 2 files.
+        const unmangled4779 = files.filter((f) =>
+          fs4779.readFileSync(f, 'utf8').includes('${CLAUDE_CONFIG_DIR:-$HOME/.claude}'),
+        );
+        assert4779.ok(
+          unmangled4779.length > 0,
+          'expected at least one unmangled ${CLAUDE_CONFIG_DIR:-$HOME/.claude} default to survive the install',
+        );
+        const mangled4779 = files.filter((f) =>
+          fs4779.readFileSync(f, 'utf8').includes('CLAUDE_CONFIG_DIR:-$HOME/.config/opencode'),
+        );
+        assert4779.equal(mangled4779.length, 0, `files carrying a mangled fallback default:\n${mangled4779.join('\n')}`);
       });
     });
   });

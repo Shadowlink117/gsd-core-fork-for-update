@@ -2042,7 +2042,17 @@ function filterRuntimeNotesForTarget(content: string, targetRuntime: string): st
   });
 }
 
-function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOverride = null, variant = null } = {}) {
+// #4779: whole-content Claude→OpenCode body rewrites shared by
+// convertClaudeToOpencodeFrontmatter and bin/install.js's post-install
+// opencode rewrite pass. Runs on the full file text (frontmatter lines
+// included) — frontmatter STRUCTURE surgery (name:/tools:/mode:) stays in the
+// converter only, so re-applying this to already-converted output is
+// idempotent.
+// DEFECT.GENERATIVE-FIX: this body is mirrored in
+// bin/install.js's applyOpencodeBodyRewrites. Neither copy re-exports the
+// other — mirror any behavior change into both. Guarded by the output-parity
+// test in tests/runtime-converters.test.cjs (#4779).
+function applyOpencodeBodyRewrites(content) {
   // Replace tool name references in content (applies to all files)
   let convertedContent = filterRuntimeNotesForTarget(content, 'opencode');
   convertedContent = convertedContent.replace(/\bAskUserQuestion\b/g, 'question');
@@ -2050,13 +2060,40 @@ function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOve
   convertedContent = convertedContent.replace(/\bTodoWrite\b/g, 'todowrite');
   // Replace /gsd-command colon variant with /gsd-command for opencode (flat command structure)
   convertedContent = convertedContent.replace(/\/gsd:/g, '/gsd-');
-  // Replace ~/.claude and $HOME/.claude with OpenCode's config location
-  convertedContent = convertedContent.replace(/~\/\.claude\b/g, '~/.config/opencode');
-  convertedContent = convertedContent.replace(/\$HOME\/\.claude\b/g, '$HOME/.config/opencode');
+  // Replace ~/.claude and $HOME/.claude with OpenCode's config location.
+  // The (?<!:-) guard keeps `${VAR:-$HOME/.claude}` shell-default fallbacks
+  // (the ordered multi-runtime fallback chain, e.g.
+  // `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`) byte-identical — without it the
+  // \b matches before `}` and the fallback default gets mangled.
+  convertedContent = convertedContent.replace(/(?<!:-)~\/\.claude\b/g, '~/.config/opencode');
+  convertedContent = convertedContent.replace(/(?<!:-)\$HOME\/\.claude\b/g, '$HOME/.config/opencode');
+  // #4779 owned refs: launcher hint names the invoking runtime flag with the
+  // scope flag preserved (never hardcode --global: --local installs carry
+  // `--claude --local`). Bare reviewer flags (`--claude` without a scope)
+  // are a different surface and stay untouched.
+  convertedContent = convertedContent.replace(/--claude (--(?:local|global))/g, '--opencode $1');
+  // #4779 owned refs: skill locator → opencode skills dir. Pattern-specific
+  // (skills/ only — `.claude/worktrees/` worktree dirs and the fallback chain
+  // carry no `.claude/skills/` occurrence, so this blanket form is safe).
+  convertedContent = convertedContent.replace(/\.claude\/skills\//g, '.opencode/skills/');
+  // #4779 owned refs: ./-anchored tree refs (skill outputs, @-includes) →
+  // opencode tree. `${_GSD_RUNTIME_ROOT}/.claude/` fallbacks contain `/.claude/`,
+  // never `./.claude/`, so they survive.
+  convertedContent = convertedContent.replace(/\.\/\.claude\//g, './.opencode/');
   // Replace general-purpose subagent type with OpenCode's equivalent "general"
   convertedContent = convertedContent.replace(/subagent_type="general-purpose"/g, 'subagent_type="general"');
   // Runtime-neutral agent name replacement (#766)
   convertedContent = neutralizeAgentReferences(convertedContent, 'AGENTS.md');
+  return convertedContent;
+}
+
+function convertClaudeToOpencodeFrontmatter(content, { isAgent = false, modelOverride = null, variant = null } = {}) {
+  // DEFECT.GENERATIVE-FIX: this body is mirrored in
+  // bin/install.js's convertClaudeToOpencodeFrontmatter (kept for
+  // bin/install.js's own module-level export/test surface). Neither copy
+  // re-exports the other — mirror any behavior change into both. Guarded by
+  // the output-parity test in tests/runtime-converters.test.cjs (#4779).
+  const convertedContent = applyOpencodeBodyRewrites(content);
 
   // The frontmatter block, as the one fence owner finds it (none → nothing to convert).
   const { frontmatter, body } = extractFrontmatterAndBody(convertedContent);
