@@ -123,6 +123,103 @@ function getNamespaceConverter() {
 }
 
 // ---------------------------------------------------------------------------
+// Hook runtime resolution (#4849)
+//
+// OpenCode may host this plugin in a NON-Node binary (Bun, SEA, native
+// host). `process.execPath` is then NOT a JS runtime, and spawning hooks
+// with it fails silently (empty stdout → silent allow). Resolve a real JS
+// runtime instead, with this exact precedence:
+//   1. `GSD_HOOK_RUNTIME` env, when set and executable
+//   2. `node` resolved via PATH (never a bare name — always an absolute path)
+//   3. `bun` via PATH
+//   4. `process.execPath` when its basename indicates a JS runtime
+//      (node/bun/opencode-dev harness), else `process.execPath` anyway WITH a
+//      one-time loud warning (last resort: better than a bare name).
+// The resolved path is cached per process, keyed on the inputs that can
+// change under it (env override + PATH + execPath).
+// ---------------------------------------------------------------------------
+
+const BOOT_FAILURE_RE =
+  /Failed to change directory|ENOENT|EACCES|bad interpreter|not recognized as an internal/i;
+
+function isExecutableFile(p) {
+  try {
+    const st = fs.statSync(p);
+    if (!st.isFile()) return false;
+    if (process.platform === "win32") return true;
+    return (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(name) {
+  const dirs = (process.env.PATH || "").split(path.delimiter);
+  const candidates =
+    process.platform === "win32"
+      ? [name, `${name}.exe`, `${name}.cmd`, `${name}.bat`]
+      : [name];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const cand of candidates) {
+      const full = path.join(dir, cand);
+      if (isExecutableFile(full)) return full;
+    }
+  }
+  return null;
+}
+
+function execPathLooksLikeJsRuntime(execPath) {
+  const base = path.basename(String(execPath || "")).toLowerCase();
+  return /^(node|bun)([.-]|$)/.test(base) || base.startsWith("opencode-dev");
+}
+
+let _cachedRuntime = null;
+let _cachedRuntimeKey = null;
+let _warnedRuntimeFallback = false;
+
+function resolveHookRuntime() {
+  const envOverride = process.env.GSD_HOOK_RUNTIME || "";
+  const key = JSON.stringify([envOverride, process.env.PATH || "", process.execPath]);
+  if (_cachedRuntime !== null && _cachedRuntimeKey === key) return _cachedRuntime;
+
+  let resolved = null;
+  if (envOverride && isExecutableFile(envOverride)) {
+    resolved = envOverride;
+  }
+  if (!resolved) resolved = findOnPath("node");
+  if (!resolved) resolved = findOnPath("bun");
+  if (!resolved) {
+    resolved = process.execPath;
+    if (!execPathLooksLikeJsRuntime(resolved) && !_warnedRuntimeFallback) {
+      _warnedRuntimeFallback = true;
+      console.error(
+        `[gsd-core] no JS runtime (node/bun) found on PATH and GSD_HOOK_RUNTIME ` +
+          `is unset — falling back to process.execPath (${resolved}), which may ` +
+          `not be a JS runtime. Hook scripts may fail to run; install node or ` +
+          `set GSD_HOOK_RUNTIME to a node binary.`,
+      );
+    }
+  }
+
+  _cachedRuntime = resolved;
+  _cachedRuntimeKey = key;
+  return resolved;
+}
+
+/**
+ * Detect a hook child that never booted its JS runtime (bad interpreter,
+ * bad cwd, missing binary): empty stdout AND (exit 127 OR the failure on
+ * stderr). Such a result must fail LOUD, never read as silent allow.
+ */
+function looksLikeRuntimeBootFailure({ stdout, stderr, exitCode } = {}) {
+  const out = stdout == null ? "" : String(stdout);
+  if (out.trim() !== "") return false;
+  if (exitCode === 127) return true;
+  return BOOT_FAILURE_RE.test(stderr == null ? "" : String(stderr));
+}
+
+// ---------------------------------------------------------------------------
 // Session state — tracked across plugin hook invocations
 // ---------------------------------------------------------------------------
 
@@ -203,7 +300,7 @@ function mapToolInput(args) {
  * @param {object} [opts]
  * @param {number} [opts.timeout=8000] spawn timeout in ms
  * @param {string} [opts.cwd]         working directory for the child
- * @returns {{ stdout: string, exitCode: number, timedOut: boolean }}
+ * @returns {{ stdout: string, stderr: string, exitCode: number, timedOut: boolean, hookFile: string }}
  */
 const warnedMissingHooks = new Set();
 
@@ -254,14 +351,18 @@ function runHook(hookFile, payload, opts = {}) {
           "/gsd-update) to restage the hooks/ bundle.",
       );
     }
-    return { stdout: "", exitCode: 0, timedOut: false };
+    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, hookFile };
   }
   const timeout =
     opts.timeout ??
     (GIT_PROBING_GUARDS.has(hookFile) ? gitProbingGuardTimeoutMs() : 8000);
   let result;
   try {
-    result = spawnSync(process.execPath, [hookPath], {
+    // #4849: never spawn hooks with a bare process.execPath — under a
+    // non-Node host (Bun/SEA/native) that binary cannot run .js files and the
+    // child fails silently (empty stdout → silent allow). Resolve a real JS
+    // runtime instead.
+    result = spawnSync(resolveHookRuntime(), [hookPath], {
       input: JSON.stringify(payload),
       encoding: "utf8",
       timeout,
@@ -270,12 +371,13 @@ function runHook(hookFile, payload, opts = {}) {
     });
   } catch {
     // Spawn failure — never break the tool call
-    return { stdout: "", exitCode: 0, timedOut: false };
+    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, hookFile };
   }
 
   const stdout = (result.stdout || "").trim();
+  const stderr = result.stderr == null ? "" : String(result.stderr);
   const exitCode = result.status == null ? 0 : result.status;
-  return { stdout, exitCode, timedOut: result.signal === "SIGTERM" };
+  return { stdout, stderr, exitCode, timedOut: result.signal === "SIGTERM", hookFile };
 }
 
 /**
@@ -315,11 +417,21 @@ function contextWarningsDisabled(cwd) {
  * - Advisory→ append to output.metadata._gsdAdvisory[] and log to stderr
  * - Silent  → no-op
  *
- * @param {{ stdout: string, exitCode: number }} hookResult
+ * @param {{ stdout: string, stderr?: string, exitCode: number }} hookResult
  * @param {object} [output]  OpenCode mutable output object (optional)
  */
 function handleHookResult(hookResult, output) {
-  const { stdout, exitCode } = hookResult;
+  const { stdout, stderr, exitCode } = hookResult;
+  // #4849: a hook child that never booted its JS runtime (bad interpreter,
+  // bad cwd, missing binary) must fail LOUD — never silent-allow. Only this
+  // shape throws; every other non-block result keeps its existing behavior.
+  if (looksLikeRuntimeBootFailure({ stdout, stderr, exitCode })) {
+    const name = hookResult.hookFile || "hook";
+    const detail = (stderr == null ? "" : String(stderr)).trim() || `exit code ${exitCode}`;
+    throw new Error(
+      `[gsd-core] ${name} failed to start (JS runtime boot failure): ${detail}`,
+    );
+  }
   if (!stdout && exitCode !== 2) return; // silent allow
 
   let parsed = null;
@@ -861,6 +973,8 @@ GsdCorePlugin._internals = {
   rewriteContent,
   isGsdManagedFile,
   handleHookResult,
+  resolveHookRuntime,
+  looksLikeRuntimeBootFailure,
   GsdCorePlugin,
 };
 
