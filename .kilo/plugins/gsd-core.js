@@ -981,8 +981,18 @@ async function GsdCoreSetup(ctx) {
       : null;
   // migrate-v1: V1 `directory` → `ctx.location.directory`.
   if (ctxDir) currentCwd = ctxDir;
+  if (!ctx || typeof ctx !== "object") {
+    console.error(
+      "[gsd-core] V2 setup: ctx is missing — NO V2 surface registered (fail-loud, continuing).",
+    );
+    return () => {};
+  }
 
   // ── tool.execute.before — PreToolUse hooks ──────────────────────────
+  // Fail-loud per domain: a missing host domain logs loudly and skips ONLY
+  // that surface instead of rejecting the whole setup promise (which would
+  // lose every other guard).
+  if (ctx.tool && typeof ctx.tool.hook === "function") {
   await ctx.tool.hook("execute.before", async (event) => {
     const claudeTool = mapToolName(event.tool);
     const rawInput =
@@ -1040,8 +1050,14 @@ async function GsdCoreSetup(ctx) {
       handleHookResult(runHook("gsd-secret-read-guard.js", prePayload()));
     }
   });
+  } else {
+    console.error(
+      "[gsd-core] V2 setup: ctx.tool unavailable — tool.execute.before guard NOT registered (fail-loud, continuing).",
+    );
+  }
 
   // ── tool.execute.after — PostToolUse hooks ──────────────────────────
+  if (ctx.tool && typeof ctx.tool.hook === "function") {
   await ctx.tool.hook("execute.after", async (event) => {
     const claudeTool = mapToolName(event.tool);
     const toolInput = mapToolInput(
@@ -1126,14 +1142,26 @@ async function GsdCoreSetup(ctx) {
       handleHookResult(r, result);
     }
   });
+  } else {
+    console.error(
+      "[gsd-core] V2 setup: ctx.tool unavailable — tool.execute.after guard NOT registered (fail-loud, continuing).",
+    );
+  }
 
   // ── shell.create.before — GSD_DIR env ───────────────────────────────
+  if (ctx.shell && typeof ctx.shell.hook === "function") {
   await ctx.shell.hook("create.before", async (shellEvent) => {
     shellEvent.env = shellEvent.env || {};
     shellEvent.env.GSD_DIR = GSD_CORE;
   });
+  } else {
+    console.error(
+      "[gsd-core] V2 setup: ctx.shell unavailable — GSD_DIR env NOT registered (fail-loud, continuing).",
+    );
+  }
 
   // ── session.compaction — PreCompact ─────────────────────────────────
+  if (ctx.session && typeof ctx.session.hook === "function") {
   await ctx.session.hook("compaction", async (compaction) => {
     const sessionId = compaction.sessionID || currentSessionId;
     if (!sessionId) return;
@@ -1146,6 +1174,7 @@ async function GsdCoreSetup(ctx) {
 
     // V1 pushed the breadcrumb onto output.context; V2 carries the MUTABLE
     // `messages` array instead ({ role, content: [{ type: "text", text }] }).
+    if (!Array.isArray(compaction.messages)) compaction.messages = [];
     compaction.messages.push({
       role: "user",
       content: [
@@ -1158,11 +1187,17 @@ async function GsdCoreSetup(ctx) {
       ],
     });
   });
+  } else {
+    console.error(
+      "[gsd-core] V2 setup: ctx.session unavailable — compaction breadcrumb NOT registered (fail-loud, continuing).",
+    );
+  }
 
   // ── Package-tree command/agent/skill registration ───────────────────
   // Same IS_PACKAGE_TREE gate as the V1 `config` hook: in an installed
   // config dir GSD's native file copy already owns this surface.
   if (IS_PACKAGE_TREE) {
+    if (ctx.command && typeof ctx.command.transform === "function") {
     await ctx.command.transform((editor) => {
       const cmds = loadDir(
         COMMANDS,
@@ -1187,8 +1222,13 @@ async function GsdCoreSetup(ctx) {
                 ? inv.prompt.text.trim()
                 : "";
             const text = args ? `${template}\n\n${args}` : template;
+            if (!ctx.session || typeof ctx.session.prompt !== "function") {
+              throw new Error(
+                "[gsd-core] command invoked but ctx.session.prompt is unavailable",
+              );
+            }
             await ctx.session.prompt({
-              sessionID: inv.sessionID,
+              sessionID: inv?.sessionID || currentSessionId,
               text: { text },
             });
           },
@@ -1196,6 +1236,13 @@ async function GsdCoreSetup(ctx) {
       }
     });
 
+    } else {
+      console.error(
+        "[gsd-core] V2 setup: ctx.command unavailable — package-tree commands NOT registered (fail-loud, continuing).",
+      );
+    }
+
+    if (ctx.agent && typeof ctx.agent.transform === "function") {
     await ctx.agent.transform((editor) => {
       const agents = loadDir(
         AGENTS,
@@ -1217,7 +1264,13 @@ async function GsdCoreSetup(ctx) {
         });
       }
     });
+    } else {
+      console.error(
+        "[gsd-core] V2 setup: ctx.agent unavailable — package-tree agents NOT registered (fail-loud, continuing).",
+      );
+    }
 
+    if (ctx.skill && typeof ctx.skill.transform === "function") {
     await ctx.skill.transform((editor) => {
       // The same rewritten-bytes cache V1 registers by path; V2 registers
       // each skill's content directly (Skill.Info: { id, name, description,
@@ -1239,6 +1292,11 @@ async function GsdCoreSetup(ctx) {
         });
       }
     });
+    } else {
+      console.error(
+        "[gsd-core] V2 setup: ctx.skill unavailable — package-tree skills NOT registered (fail-loud, continuing).",
+      );
+    }
   }
 
   // ── Event stream ────────────────────────────────────────────────────
@@ -1247,6 +1305,7 @@ async function GsdCoreSetup(ctx) {
   // top-level `location` against ctx.location: without the filter, session
   // hooks would fire for other locations on the same server.
   const aborter = new AbortController();
+  if (ctx.event && typeof ctx.event.subscribe === "function") {
   async function drainGsdCoreV2Events() {
     const stream = await ctx.event.subscribe({ signal: aborter.signal });
     for await (const busEvent of stream) {
@@ -1331,6 +1390,11 @@ async function GsdCoreSetup(ctx) {
         (err && err.message ? err.message : err),
     );
   });
+  } else {
+    console.error(
+      "[gsd-core] V2 setup: ctx.event unavailable — event subscriptions NOT registered (fail-loud, continuing).",
+    );
+  }
 
   // Cleanup: aborting the signal ends the subscribe stream (migrate-v1:
   // "cleanup function returned by setup").
