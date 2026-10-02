@@ -610,3 +610,72 @@ test('#2697: context-monitor skipped for Write when context_warnings disabled (n
     `context-monitor spawn must be skipped for Write when context_warnings:false; spawn argvs: ${JSON.stringify(spawns)}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// #4916/#4849: failing-first tests for the OpenCode plugin v2 bugs.
+// runHook is NOT exposed on _internals, so the runtime-resolution and
+// boot-failure tests drive the plugin via the temp-install-layout + stub-hook
+// pattern above (or call handleHookResult directly with a canned child result).
+// ---------------------------------------------------------------------------
+
+test('v2-default-export-schema: default export satisfies the v2 loader schema (id + setup/effect)', () => {
+  const mod = require(ADAPTER_SRC);
+  const def = mod.default ?? mod;
+  assert.equal(def.id, 'gsd-core');
+  assert.equal(typeof (def.setup ?? def.effect), 'function');
+});
+
+test('hook-runtime-resolution: hook executes when process.execPath is a non-JS host binary', async (t) => {
+  // A non-node OpenCode host means process.execPath is NOT a JS runtime, so
+  // runHook must resolve a real JS runtime (a `node` on PATH) instead of
+  // spawning hooks with process.execPath (which silently allows on failure).
+  const binDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-oc-stubbin-')));
+  t.after(() => cleanup(binDir));
+  // Stub `node` on PATH: ignores argv, echoes a canned block verdict.
+  const stubNode = path.join(binDir, 'node');
+  fs.writeFileSync(
+    stubNode,
+    '#!/bin/sh\nprintf \'%s\' \'{"decision":"block","reason":"stub runtime block"}\'\n',
+  );
+  fs.chmodSync(stubNode, 0o755);
+  // Fake non-JS host binary: exits 0 with no output (would read as allow if spawned).
+  const fakeHost = path.join(binDir, 'opencode-fake-host');
+  fs.writeFileSync(fakeHost, '#!/bin/sh\nexit 0\n');
+  fs.chmodSync(fakeHost, 0o755);
+
+  const realExecPath = process.execPath;
+  const realPath = process.env.PATH;
+  process.execPath = fakeHost;
+  process.env.PATH = binDir + path.delimiter + realPath;
+  try {
+    const { mod } = buildInstalledLayout(t, {
+      'gsd-prompt-guard.js': stubHook(''),
+      'gsd-read-guard.js': stubHook(''),
+      'gsd-worktree-path-guard.js': stubHook(''),
+      'gsd-workflow-guard.js': stubHook(''),
+      'gsd-write-guard.js': stubHook(''),
+    });
+    const handlers = await mod.server({ directory: process.cwd() });
+    await assert.rejects(
+      () => handlers['tool.execute.before'](
+        { tool: 'write' },
+        { args: { filePath: '/proj/notes.md', content: 'ok' } },
+      ),
+      /stub runtime block/,
+    );
+  } finally {
+    process.execPath = realExecPath;
+    process.env.PATH = realPath;
+  }
+});
+
+test('boot-failure-is-loud: child output matching a runtime boot failure throws instead of allowing', () => {
+  // A hook child that never booted (e.g. bad cwd) reports empty stdout with
+  // the failure on stderr; that must throw (fail loud), not silent-allow.
+  assert.throws(
+    () => _internals.handleHookResult(
+      { stdout: '', stderr: 'Error: Failed to change directory to /nowhere: no such directory', exitCode: 0 },
+    ),
+    /Failed to change directory/,
+  );
+});
