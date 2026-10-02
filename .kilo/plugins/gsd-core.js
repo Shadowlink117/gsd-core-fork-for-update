@@ -123,6 +123,103 @@ function getNamespaceConverter() {
 }
 
 // ---------------------------------------------------------------------------
+// Hook runtime resolution (#4849)
+//
+// OpenCode may host this plugin in a NON-Node binary (Bun, SEA, native
+// host). `process.execPath` is then NOT a JS runtime, and spawning hooks
+// with it fails silently (empty stdout → silent allow). Resolve a real JS
+// runtime instead, with this exact precedence:
+//   1. `GSD_HOOK_RUNTIME` env, when set and executable
+//   2. `node` resolved via PATH (never a bare name — always an absolute path)
+//   3. `bun` via PATH
+//   4. `process.execPath` when its basename indicates a JS runtime
+//      (node/bun/opencode-dev harness), else `process.execPath` anyway WITH a
+//      one-time loud warning (last resort: better than a bare name).
+// The resolved path is cached per process, keyed on the inputs that can
+// change under it (env override + PATH + execPath).
+// ---------------------------------------------------------------------------
+
+const BOOT_FAILURE_RE =
+  /Failed to change directory|ENOENT|EACCES|bad interpreter|not recognized as an internal/i;
+
+function isExecutableFile(p) {
+  try {
+    const st = fs.statSync(p);
+    if (!st.isFile()) return false;
+    if (process.platform === "win32") return true;
+    return (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(name) {
+  const dirs = (process.env.PATH || "").split(path.delimiter);
+  const candidates =
+    process.platform === "win32"
+      ? [name, `${name}.exe`, `${name}.cmd`, `${name}.bat`]
+      : [name];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const cand of candidates) {
+      const full = path.join(dir, cand);
+      if (isExecutableFile(full)) return full;
+    }
+  }
+  return null;
+}
+
+function execPathLooksLikeJsRuntime(execPath) {
+  const base = path.basename(String(execPath || "")).toLowerCase();
+  return /^(node|bun)([.-]|$)/.test(base) || base.startsWith("opencode-dev");
+}
+
+let _cachedRuntime = null;
+let _cachedRuntimeKey = null;
+let _warnedRuntimeFallback = false;
+
+function resolveHookRuntime() {
+  const envOverride = process.env.GSD_HOOK_RUNTIME || "";
+  const key = JSON.stringify([envOverride, process.env.PATH || "", process.execPath]);
+  if (_cachedRuntime !== null && _cachedRuntimeKey === key) return _cachedRuntime;
+
+  let resolved = null;
+  if (envOverride && isExecutableFile(envOverride)) {
+    resolved = envOverride;
+  }
+  if (!resolved) resolved = findOnPath("node");
+  if (!resolved) resolved = findOnPath("bun");
+  if (!resolved) {
+    resolved = process.execPath;
+    if (!execPathLooksLikeJsRuntime(resolved) && !_warnedRuntimeFallback) {
+      _warnedRuntimeFallback = true;
+      console.error(
+        `[gsd-core] no JS runtime (node/bun) found on PATH and GSD_HOOK_RUNTIME ` +
+          `is unset — falling back to process.execPath (${resolved}), which may ` +
+          `not be a JS runtime. Hook scripts may fail to run; install node or ` +
+          `set GSD_HOOK_RUNTIME to a node binary.`,
+      );
+    }
+  }
+
+  _cachedRuntime = resolved;
+  _cachedRuntimeKey = key;
+  return resolved;
+}
+
+/**
+ * Detect a hook child that never booted its JS runtime (bad interpreter,
+ * bad cwd, missing binary): empty stdout AND (exit 127 OR the failure on
+ * stderr). Such a result must fail LOUD, never read as silent allow.
+ */
+function looksLikeRuntimeBootFailure({ stdout, stderr, exitCode } = {}) {
+  const out = stdout == null ? "" : String(stdout);
+  if (out.trim() !== "") return false;
+  if (exitCode === 127) return true;
+  return BOOT_FAILURE_RE.test(stderr == null ? "" : String(stderr));
+}
+
+// ---------------------------------------------------------------------------
 // Session state — tracked across plugin hook invocations
 // ---------------------------------------------------------------------------
 
@@ -203,7 +300,7 @@ function mapToolInput(args) {
  * @param {object} [opts]
  * @param {number} [opts.timeout=8000] spawn timeout in ms
  * @param {string} [opts.cwd]         working directory for the child
- * @returns {{ stdout: string, exitCode: number, timedOut: boolean }}
+ * @returns {{ stdout: string, stderr: string, exitCode: number, timedOut: boolean, hookFile: string }}
  */
 const warnedMissingHooks = new Set();
 
@@ -254,14 +351,18 @@ function runHook(hookFile, payload, opts = {}) {
           "/gsd-update) to restage the hooks/ bundle.",
       );
     }
-    return { stdout: "", exitCode: 0, timedOut: false };
+    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, hookFile };
   }
   const timeout =
     opts.timeout ??
     (GIT_PROBING_GUARDS.has(hookFile) ? gitProbingGuardTimeoutMs() : 8000);
   let result;
   try {
-    result = spawnSync(process.execPath, [hookPath], {
+    // #4849: never spawn hooks with a bare process.execPath — under a
+    // non-Node host (Bun/SEA/native) that binary cannot run .js files and the
+    // child fails silently (empty stdout → silent allow). Resolve a real JS
+    // runtime instead.
+    result = spawnSync(resolveHookRuntime(), [hookPath], {
       input: JSON.stringify(payload),
       encoding: "utf8",
       timeout,
@@ -270,12 +371,13 @@ function runHook(hookFile, payload, opts = {}) {
     });
   } catch {
     // Spawn failure — never break the tool call
-    return { stdout: "", exitCode: 0, timedOut: false };
+    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, hookFile };
   }
 
   const stdout = (result.stdout || "").trim();
+  const stderr = result.stderr == null ? "" : String(result.stderr);
   const exitCode = result.status == null ? 0 : result.status;
-  return { stdout, exitCode, timedOut: result.signal === "SIGTERM" };
+  return { stdout, stderr, exitCode, timedOut: result.signal === "SIGTERM", hookFile };
 }
 
 /**
@@ -315,11 +417,21 @@ function contextWarningsDisabled(cwd) {
  * - Advisory→ append to output.metadata._gsdAdvisory[] and log to stderr
  * - Silent  → no-op
  *
- * @param {{ stdout: string, exitCode: number }} hookResult
+ * @param {{ stdout: string, stderr?: string, exitCode: number }} hookResult
  * @param {object} [output]  OpenCode mutable output object (optional)
  */
 function handleHookResult(hookResult, output) {
-  const { stdout, exitCode } = hookResult;
+  const { stdout, stderr, exitCode } = hookResult;
+  // #4849: a hook child that never booted its JS runtime (bad interpreter,
+  // bad cwd, missing binary) must fail LOUD — never silent-allow. Only this
+  // shape throws; every other non-block result keeps its existing behavior.
+  if (looksLikeRuntimeBootFailure({ stdout, stderr, exitCode })) {
+    const name = hookResult.hookFile || "hook";
+    const detail = (stderr == null ? "" : String(stderr)).trim() || `exit code ${exitCode}`;
+    throw new Error(
+      `[gsd-core] ${name} failed to start (JS runtime boot failure): ${detail}`,
+    );
+  }
   if (!stdout && exitCode !== 2) return; // silent allow
 
   let parsed = null;
@@ -829,6 +941,404 @@ const GsdCorePlugin = async ({ directory } = {}) => {
   };
 };
 
+// ===========================================================================
+// V2 entrypoint — `setup(ctx)` (#4916)
+//
+// OpenCode v2 loads plugins through the `@opencode/plugin` contract
+// (`{ id, setup }`: an id plus a setup function receiving a domain context)
+// instead of the V1 `server()` hook map. This file serves both loaders from
+// one adapter: the V1 `server` map above stays behavior-identical, and
+// `setup` below registers V2 equivalents of every V1 surface through the V2
+// domain APIs (verified against `@opencode/plugin@2.0.22` +
+// `@opencode/client@2.0.22` types and
+// https://opencode.ai/v2/docs/build/plugins/migrate-v1):
+//
+//   V1 `tool.execute.before`             → ctx.tool.hook("execute.before", …)
+//     V2 before event: { tool, input (MUTABLE), sessionID, agent, messageID, id }
+//   V1 `tool.execute.after`              → ctx.tool.hook("execute.after", …)
+//     V2 after event: { tool, input (readonly), … } + a status union —
+//     `completed` carries MUTABLE `result`, `error` carries readonly `error`
+//   V1 `shell.env`                       → ctx.shell.hook("create.before", …)
+//     V2 event: { command, cwd, timeout, shell, env (MUTABLE) }
+//   V1 `experimental.session.compacting` → ctx.session.hook("compaction", …)
+//     V2 event: MUTABLE system/messages/options/tools + optional `result`
+//   V1 `event` dispatcher                → ctx.event.subscribe()
+//     (AsyncIterable over the server-global bus; payloads under `data`,
+//     filtered by top-level `location` vs ctx.location)
+//   V1 `config` command/agent/skill registration → ctx.command / ctx.agent /
+//     ctx.skill transforms, gated on IS_PACKAGE_TREE exactly like V1
+//
+// Every hook body reuses the same module helpers as V1 (runHook,
+// handleHookResult, mapToolName, mapToolInput, …) unchanged. V1-only
+// extension events with no V2 union member are dropped: `session.error` does
+// not exist on the V2 bus, so there is no branch for it.
+// ===========================================================================
+
+async function GsdCoreSetup(ctx) {
+  const ctxDir =
+    ctx && ctx.location && typeof ctx.location.directory === "string"
+      ? ctx.location.directory
+      : null;
+  // migrate-v1: V1 `directory` → `ctx.location.directory`.
+  if (ctxDir) currentCwd = ctxDir;
+
+  // ── tool.execute.before — PreToolUse hooks ──────────────────────────
+  await ctx.tool.hook("execute.before", async (event) => {
+    const claudeTool = mapToolName(event.tool);
+    const rawInput =
+      event.input && typeof event.input === "object" ? event.input : {};
+    const toolInput = mapToolInput(rawInput);
+    const cwd = currentCwd;
+
+    // 0. Read path rewrite — the same rewrite as V1, applied to the MUTABLE
+    //    V2 `input` in place (V1 mutated output.args; V2 carries args on
+    //    event.input directly).
+    if (claudeTool === "Read" && toolInput.file_path) {
+      const original = toolInput.file_path;
+      const rewritten = original
+        .replace(/^~\/\.claude\/gsd-core\//, GSD_CORE + "/")
+        .replace(/(?:.*)\/\.claude\/gsd-core\//, GSD_CORE + "/");
+      if (rewritten !== original) {
+        if (rawInput.filePath) rawInput.filePath = rewritten;
+        else if (rawInput.path) rawInput.path = rewritten;
+        else if (rawInput.file_path) rawInput.file_path = rewritten;
+        else rawInput.filePath = rewritten;
+      }
+    }
+
+    const basePayload = { hook_event_name: "PreToolUse", cwd };
+    // NOTE: session_id intentionally omitted for PreToolUse hooks (same as
+    // V1 — gsd-read-guard.js treats a non-empty session_id as a Claude Code
+    // session and skips its advisory; on OpenCode we WANT the advisory).
+    const prePayload = (overrides = {}) => ({
+      ...basePayload,
+      tool_name: claudeTool,
+      tool_input: toolInput,
+      ...overrides,
+    });
+    const isWriteLike = ["Write", "Edit", "MultiEdit"].includes(claudeTool);
+
+    // NOTE: the V2 before event carries no mutable metadata object, so hook
+    // advisories surface best-effort via console.error inside
+    // handleHookResult; blocks still throw, aborting the tool call.
+    if (claudeTool === "Write" || claudeTool === "Edit") {
+      handleHookResult(runHook("gsd-prompt-guard.js", prePayload()));
+    }
+    if (claudeTool === "Write" || claudeTool === "Edit") {
+      handleHookResult(runHook("gsd-read-guard.js", prePayload()));
+    }
+    if (isWriteLike) {
+      handleHookResult(runHook("gsd-worktree-path-guard.js", prePayload()));
+    }
+    if (claudeTool === "Write") {
+      handleHookResult(runHook("gsd-write-guard.js", prePayload()));
+    }
+    if (isWriteLike || claudeTool === "Bash") {
+      handleHookResult(runHook("gsd-workflow-guard.js", prePayload()));
+    }
+    if (["Read", "Grep", "Bash"].includes(claudeTool)) {
+      handleHookResult(runHook("gsd-secret-read-guard.js", prePayload()));
+    }
+  });
+
+  // ── tool.execute.after — PostToolUse hooks ──────────────────────────
+  await ctx.tool.hook("execute.after", async (event) => {
+    const claudeTool = mapToolName(event.tool);
+    const toolInput = mapToolInput(
+      event.input && typeof event.input === "object" ? event.input : {},
+    );
+    const cwd = currentCwd;
+
+    // The `error` union member is readonly — nothing to rewrite or scan.
+    // Usage tracking still applies, then return.
+    if (!event || event.status !== "completed" || !event.result) {
+      if (currentSessionId && !contextWarningsDisabled(cwd)) {
+        handleHookResult(
+          runHook("gsd-context-monitor.js", {
+            hook_event_name: "PostToolUse",
+            tool_name: claudeTool,
+            tool_input: toolInput,
+            session_id: currentSessionId,
+            cwd,
+          }),
+        );
+      }
+      return;
+    }
+    const result = event.result;
+
+    // GSD content transform — the same rewrite as V1, applied to the MUTABLE
+    // V2 `result.content` BEFORE injection scanning so the scanner sees the
+    // final content.
+    if (
+      claudeTool === "Read" &&
+      result.content !== undefined &&
+      isGsdManagedFile(toolInput.file_path)
+    ) {
+      if (typeof result.content === "string") {
+        result.content = rewriteContent(result.content);
+      } else if (Array.isArray(result.content)) {
+        result.content = result.content.map((part) =>
+          part && part.type === "text" && typeof part.text === "string"
+            ? { ...part, text: rewriteContent(part.text) }
+            : part,
+        );
+      }
+    }
+    const toolResponse =
+      typeof result.content === "string"
+        ? result.content
+        : Array.isArray(result.content)
+          ? result.content
+              .filter((p) => p && p.type === "text")
+              .map((p) => p.text)
+              .join("\n")
+          : result.content;
+
+    // gsd-read-injection-scanner.js — scan Read/WebFetch/WebSearch results
+    if (
+      claudeTool === "Read" ||
+      claudeTool === "WebFetch" ||
+      claudeTool === "WebSearch"
+    ) {
+      const r = runHook("gsd-read-injection-scanner.js", {
+        hook_event_name: "PostToolUse",
+        tool_name: claudeTool,
+        tool_input: toolInput,
+        tool_response: toolResponse,
+        cwd,
+      });
+      // V2 `result` is MUTABLE, so advisories accumulate on
+      // result.metadata._gsdAdvisory exactly like V1's output.metadata.
+      handleHookResult(r, result);
+      return;
+    }
+
+    // gsd-context-monitor.js — same #2697 in-process skip gate as V1.
+    if (currentSessionId && !contextWarningsDisabled(cwd)) {
+      const r = runHook("gsd-context-monitor.js", {
+        hook_event_name: "PostToolUse",
+        tool_name: claudeTool,
+        tool_input: toolInput,
+        session_id: currentSessionId,
+        cwd,
+      });
+      handleHookResult(r, result);
+    }
+  });
+
+  // ── shell.create.before — GSD_DIR env ───────────────────────────────
+  await ctx.shell.hook("create.before", async (shellEvent) => {
+    shellEvent.env = shellEvent.env || {};
+    shellEvent.env.GSD_DIR = GSD_CORE;
+  });
+
+  // ── session.compaction — PreCompact ─────────────────────────────────
+  await ctx.session.hook("compaction", async (compaction) => {
+    const sessionId = compaction.sessionID || currentSessionId;
+    if (!sessionId) return;
+    const r = runHook("gsd-context-monitor.js", {
+      hook_event_name: "PreCompact",
+      session_id: sessionId,
+      cwd: currentCwd,
+    });
+    handleHookResult(r);
+
+    // V1 pushed the breadcrumb onto output.context; V2 carries the MUTABLE
+    // `messages` array instead ({ role, content: [{ type: "text", text }] }).
+    compaction.messages.push({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `[GSD] Active session: ${sessionId}. ` +
+            "Preserve any in-flight phase/plan state.",
+        },
+      ],
+    });
+  });
+
+  // ── Package-tree command/agent/skill registration ───────────────────
+  // Same IS_PACKAGE_TREE gate as the V1 `config` hook: in an installed
+  // config dir GSD's native file copy already owns this surface.
+  if (IS_PACKAGE_TREE) {
+    await ctx.command.transform((editor) => {
+      const cmds = loadDir(
+        COMMANDS,
+        (f) => "gsd-" + f.slice(0, -3),
+        (body, fm, name) => ({
+          template: rewriteRefs(body.trim()),
+          description: fm.description || `GSD ${name.slice(0, -3)} command`,
+        }),
+      );
+      for (const [k, v] of Object.entries(cmds)) {
+        const template = v.template;
+        editor.add({
+          name: k,
+          description: v.description,
+          // V1 commands are markdown templates expanded by the host; V2
+          // commands execute a function, so the executor delivers the
+          // rewritten template as a session prompt, appending the
+          // invocation's own prompt text (the user's command args).
+          execute: async (inv) => {
+            const args =
+              inv && inv.prompt && typeof inv.prompt.text === "string"
+                ? inv.prompt.text.trim()
+                : "";
+            const text = args ? `${template}\n\n${args}` : template;
+            await ctx.session.prompt({
+              sessionID: inv.sessionID,
+              text: { text },
+            });
+          },
+        });
+      }
+    });
+
+    await ctx.agent.transform((editor) => {
+      const agents = loadDir(
+        AGENTS,
+        (f) => f.slice(0, -3),
+        (body, fm, name) => ({
+          prompt: rewriteRefs(body.trim()),
+          description: fm.description || `GSD ${name.slice(0, -3)} agent`,
+          mode: fm.mode || "subagent",
+        }),
+      );
+      for (const [k, v] of Object.entries(agents)) {
+        // The V2 agent editor exposes get/update/remove but no add — only
+        // agents the host already knows can receive the GSD system prompt.
+        if (!editor.get(k)) continue;
+        editor.update(k, (agent) => {
+          agent.system = v.prompt;
+          agent.description = v.description;
+          agent.mode = v.mode;
+        });
+      }
+    });
+
+    await ctx.skill.transform((editor) => {
+      // The same rewritten-bytes cache V1 registers by path; V2 registers
+      // each skill's content directly (Skill.Info: { id, name, description,
+      // path, content }).
+      const skillsCache = prepareSkillsCache();
+      const skillsRoot = skillsCache || SKILLS;
+      if (!fs.existsSync(skillsRoot)) return;
+      for (const dir of fs.readdirSync(skillsRoot)) {
+        const skillFile = path.join(skillsRoot, dir, "SKILL.md");
+        if (!fs.existsSync(skillFile)) continue;
+        const raw = fs.readFileSync(skillFile, "utf8");
+        const { frontmatter } = parseFrontmatter(raw);
+        editor.add({
+          id: dir,
+          name: dir,
+          description: frontmatter.description || `GSD ${dir} skill`,
+          path: skillFile,
+          content: raw,
+        });
+      }
+    });
+  }
+
+  // ── Event stream ────────────────────────────────────────────────────
+  // ctx.event.subscribe() yields the server-global V2 event bus as an
+  // AsyncIterable with payloads under `data`. Filter EVERY event by its
+  // top-level `location` against ctx.location: without the filter, session
+  // hooks would fire for other locations on the same server.
+  const aborter = new AbortController();
+  async function drainGsdCoreV2Events() {
+    const stream = await ctx.event.subscribe({ signal: aborter.signal });
+    for await (const busEvent of stream) {
+      if (!busEvent || typeof busEvent.type !== "string") continue;
+      if (
+        busEvent.location &&
+        ctxDir &&
+        busEvent.location.directory !== ctxDir
+      ) {
+        continue;
+      }
+
+      // session.created → SessionStart hooks. V2 payload under `data`
+      // (SessionCreated.data: { sessionID, location, … }); cwd from
+      // data.location.directory.
+      if (busEvent.type === "session.created") {
+        const data = busEvent.data || {};
+        currentSessionId = data.sessionID || null;
+        if (data.location && data.location.directory) {
+          currentCwd = data.location.directory;
+        }
+        // gsd-ensure-canonical-path.js — no stdin dependency; silent
+        runHook("gsd-ensure-canonical-path.js", {
+          hook_event_name: "SessionStart",
+          session_id: currentSessionId,
+          cwd: currentCwd,
+        });
+        // gsd-check-update.js — spawns its own background worker; no stdin
+        runHook("gsd-check-update.js", {
+          hook_event_name: "SessionStart",
+          session_id: currentSessionId,
+          cwd: currentCwd,
+        });
+        continue;
+      }
+
+      // filesystem.changed → FileChanged hook (config.json reload). V2 data
+      // carries only { file, event } — no cwd — so cwd comes from the
+      // top-level location.directory.
+      if (busEvent.type === "filesystem.changed") {
+        const cwd =
+          (busEvent.location && busEvent.location.directory) || currentCwd;
+        const data = busEvent.data || {};
+        const filePath = data.file || "";
+        if (!filePath.endsWith("config.json")) continue;
+        const expected = path.join(cwd, ".planning", "config.json");
+        if (path.resolve(filePath) !== path.resolve(expected)) continue;
+        const r = runHook("gsd-config-reload.js", {
+          hook_event_name: "FileChanged",
+          file_path: filePath,
+          event: data.event || "change",
+          cwd,
+        });
+        // Advisory-only (additionalContext); surface to logs
+        handleHookResult(r);
+        continue;
+      }
+
+      // session.idle ↔ Claude Stop lifecycle point: recognized no-op
+      // sentinel, mirroring V1.
+      if (busEvent.type === "session.idle") continue;
+
+      // permission.asked / permission.replied: recognized sentinels,
+      // mirroring V1 (the engine owns phase sequencing; this bus is
+      // session/tool/permission-scoped).
+      if (
+        busEvent.type === "permission.asked" ||
+        busEvent.type === "permission.replied"
+      ) {
+        continue;
+      }
+
+      // NOTE: V1's `session.error` branch is intentionally absent — V2 has
+      // no such union member, so there is nothing to recognize.
+    }
+  }
+  drainGsdCoreV2Events().catch((err) => {
+    // Abort-on-cleanup ends the stream; anything else is a real failure.
+    if ((err && err.name === "AbortError") || aborter.signal.aborted) return;
+    console.error(
+      `[gsd-core] V2 event subscription ended: ` +
+        (err && err.message ? err.message : err),
+    );
+  });
+
+  // Cleanup: aborting the signal ends the subscribe stream (migrate-v1:
+  // "cleanup function returned by setup").
+  return () => {
+    aborter.abort();
+  };
+}
+
 // Export shape — verified against OpenCode's plugin loader source
 // (packages/opencode/src/plugin). The loader imports this module and runs
 // `for (const entry of Object.values(mod)) { getServerPlugin(entry) }`, where
@@ -861,12 +1371,24 @@ GsdCorePlugin._internals = {
   rewriteContent,
   isGsdManagedFile,
   handleHookResult,
+  resolveHookRuntime,
+  looksLikeRuntimeBootFailure,
   GsdCorePlugin,
 };
 
 const gsdCorePluginExport = { server: GsdCorePlugin };
 Object.defineProperty(gsdCorePluginExport, "id", {
   value: "gsd-core",
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+// V2 dual entrypoint (#4916): the v2 loader reads `id` + `setup` off the
+// default export. NON-ENUMERABLE for the same reason as `id` — the V1 loader
+// loop (`for (const entry of Object.values(mod))`) must still see exactly
+// `[server]`, or `setup` would be invoked as a second V1 plugin and break.
+Object.defineProperty(gsdCorePluginExport, "setup", {
+  value: GsdCoreSetup,
   enumerable: false,
   writable: false,
   configurable: false,
