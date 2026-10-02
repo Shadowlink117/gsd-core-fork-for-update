@@ -2759,3 +2759,163 @@ describe('converters read the frontmatter block the one fence owner finds', () =
     assert.strictEqual(rac.injectEffortFrontmatter(preambled, 'high'), preambled);
   });
 });
+
+// ─── #4779: opencode install rewrites Claude-only refs ───────────────────────
+//
+// Failing-first coverage for #4779. convertClaudeToOpencodeFrontmatter must
+// rewrite the three Claude-only patterns that change behavior on OpenCode,
+// while leaving the ordered multi-runtime fallback chain byte-identical:
+//
+//   owned (rewrite):  `.claude/skills/` locator, `--claude --local/--global`
+//                     launcher hint (naming the INVOKING runtime flag), and
+//                     `@`-anchored `.claude/gsd-core/` includes.
+//   fallback (keep):  `${_GSD_RUNTIME_ROOT}/.claude/…`, `.codex/gsd-core/…`,
+//                     `${CLAUDE_CONFIG_DIR:-…}`, `${CLAUDE_ENV_FILE:-…}`.
+//
+// The post-install leak scan must cover exactly this owned set (scan parity),
+// verified end-to-end through a real minimal opencode install (#4667 shape).
+{
+  const { describe: describe4779, test: test4779, before: before4779, after: after4779 } = require('node:test');
+  const assert4779 = require('node:assert/strict');
+  const fs4779 = require('node:fs');
+  const path4779 = require('node:path');
+  const { convertClaudeToOpencodeFrontmatter: convert4779 } = require('../bin/install.js');
+
+  const wrap4779 = (body) => ['---', 'name: gsd-probe', 'description: probe', '---', '', body].join('\n');
+
+  describe4779('#4779: opencode converter rewrites Claude-only refs', () => {
+    describe4779('skill locator rewrite (.claude/skills/ → .opencode/skills/)', () => {
+      test4779('rewrites a bare .claude/skills/ reference', () => {
+        const out = convert4779(wrap4779('Check .claude/skills/ for project skills before planning.'));
+        assert4779.ok(out.includes('.opencode/skills/'), `locator must point at opencode skills, got:\n${out}`);
+        assert4779.ok(!out.includes('.claude/skills/'), `no .claude/skills/ may survive, got:\n${out}`);
+      });
+
+      test4779('rewrites a ./-anchored ./.claude/skills/ locator (sketch-findings shape)', () => {
+        const out = convert4779(wrap4779('SKILL=$(ls ./.claude/skills/sketch-findings-demo/SKILL.md 2>/dev/null | head -1 || true)'));
+        assert4779.ok(
+          out.includes('./.opencode/skills/sketch-findings-demo/SKILL.md'),
+          `relative locator must point at opencode skills, got:\n${out}`,
+        );
+        assert4779.ok(!out.includes('.claude/skills/'), `no .claude/skills/ may survive, got:\n${out}`);
+      });
+    });
+
+    describe4779('launcher hint rewrite (names the invoking runtime flag)', () => {
+      // Parameterized by scope: the rule must swap the RUNTIME flag and keep
+      // the scope flag. Hardcoding `--opencode --global` would repeat the
+      // original bug for --local installs (and vice versa).
+      for (const scope of ['local', 'global']) {
+        test4779(`rewrites --claude --${scope} to the invoking --opencode --${scope} flag`, () => {
+          const out = convert4779(wrap4779(`Run: npx -y @opengsd/gsd-core@latest --claude --${scope}`));
+          assert4779.ok(
+            out.includes(`--opencode --${scope}`),
+            `hint must name the invoking runtime and keep scope, got:\n${out}`,
+          );
+          assert4779.ok(!out.includes('--claude'), `no --claude flag may survive, got:\n${out}`);
+        });
+      }
+    });
+
+    describe4779('@-include rewrite under gsd-core/', () => {
+      test4779('rewrites a relative @./.claude/gsd-core/ include to the opencode tree', () => {
+        const out = convert4779(wrap4779('If `NODE_REPAIR` is `true`: invoke `@./.claude/gsd-core/workflows/node-repair.md` next.'));
+        assert4779.ok(
+          out.includes('@./.opencode/gsd-core/workflows/node-repair.md'),
+          `relative include must point at the opencode tree, got:\n${out}`,
+        );
+        assert4779.ok(!out.includes('@./.claude/'), `no @./.claude/ include may survive, got:\n${out}`);
+      });
+
+      test4779('keeps the @~/.claude/gsd-core/ conversion pointed at the opencode config root', () => {
+        // Guard: already handled by the ~/ path rule — Task 2 must not regress it.
+        const out = convert4779(wrap4779('Read @~/.claude/gsd-core/commands/gsd/foo.md end-to-end.'));
+        assert4779.ok(
+          out.includes('@~/.config/opencode/gsd-core/commands/gsd/foo.md'),
+          `home-anchored include must point at the opencode config root, got:\n${out}`,
+        );
+        assert4779.ok(!out.includes('@~/.claude/'), `no @~/.claude/ include may survive, got:\n${out}`);
+      });
+    });
+
+    describe4779('fallback-chain negatives (must stay UNCHANGED)', () => {
+      const fallbacks4779 = [
+        ['${_GSD_RUNTIME_ROOT}/.claude fallback probe', 'if _gsd_at "${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/gsd-tools.cjs"; then ok; fi'],
+        ['${CLAUDE_CONFIG_DIR:-$HOME/.claude} default', 'see "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/gsd-tools.cjs" next'],
+        ['${CLAUDE_ENV_FILE:-} export block', 'if [ -n "${CLAUDE_ENV_FILE:-}" ]; then echo path-exported; fi'],
+        ['.codex/gsd-core fallback probe', 'probe "${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/gsd-tools.cjs" too'],
+      ];
+      // Both converter modes: the body rewrite rules run before frontmatter
+      // handling, so the fallback chain must survive in agents and commands.
+      for (const isAgent of [false, true]) {
+        for (const [name, sample] of fallbacks4779) {
+          test4779(`${name} survives opencode conversion byte-identical (isAgent: ${isAgent})`, () => {
+            const out = convert4779(wrap4779(sample), { isAgent });
+            assert4779.ok(out.includes(sample), `${name} is fallback chain, not an owned ref, got:\n${out}`);
+          });
+        }
+      }
+    });
+
+    describe4779('post-install scan parity (real minimal opencode install)', () => {
+      let root4779 = null;
+      let configDir4779 = null;
+
+      before4779(() => {
+        process.env.GSD_TEST_MODE = '1';
+        const { runMinimalInstall } = require('./helpers/install-shared.cjs');
+        const res = runMinimalInstall({ runtime: 'opencode', scope: 'global' });
+        root4779 = res.root;
+        configDir4779 = res.configDir;
+      });
+
+      after4779(() => {
+        if (root4779) require('./helpers.cjs').cleanup(root4779);
+      });
+
+      function installedSources4779() {
+        const out = [];
+        const walk = (dir) => {
+          if (!fs4779.existsSync(dir)) return;
+          for (const entry of fs4779.readdirSync(dir, { withFileTypes: true })) {
+            const p = path4779.join(dir, entry.name);
+            if (entry.isDirectory()) walk(p);
+            else if ((p.endsWith('.md') || p.endsWith('.toml')) && entry.name !== 'CHANGELOG.md') out.push(p);
+          }
+        };
+        walk(configDir4779);
+        return out;
+      }
+
+      function residualFiles4779(re) {
+        return installedSources4779().filter((f) => re.test(fs4779.readFileSync(f, 'utf8')));
+      }
+
+      test4779('opencode install leaves zero --claude launcher hints', () => {
+        const leaks = residualFiles4779(/--claude --(?:local|global)/);
+        assert4779.equal(leaks.length, 0, `files still carrying --claude hints:\n${leaks.join('\n')}`);
+      });
+
+      test4779('opencode install leaves zero .claude/skills/ locators', () => {
+        const leaks = residualFiles4779(/\.claude\/skills\//);
+        assert4779.equal(leaks.length, 0, `files still carrying .claude/skills/ locators:\n${leaks.join('\n')}`);
+      });
+
+      test4779('opencode install leaves zero @-anchored .claude includes', () => {
+        const leaks = residualFiles4779(/@(?:~|\$HOME|\.)\/\.claude\//);
+        assert4779.equal(leaks.length, 0, `files still carrying @-anchored .claude includes:\n${leaks.join('\n')}`);
+      });
+
+      test4779('opencode install keeps the multi-runtime fallback chain intact', () => {
+        const files = installedSources4779();
+        assert4779.ok(files.length > 0, 'the install must emit .md/.toml artifacts to scan');
+        const hasRuntimeRootFallback = files.some((f) =>
+          fs4779.readFileSync(f, 'utf8').includes('${_GSD_RUNTIME_ROOT}/.claude/'),
+        );
+        const hasConfigDirFallback = files.some((f) => fs4779.readFileSync(f, 'utf8').includes('CLAUDE_CONFIG_DIR'));
+        assert4779.ok(hasRuntimeRootFallback, 'expected ${_GSD_RUNTIME_ROOT}/.claude fallbacks to survive the install');
+        assert4779.ok(hasConfigDirFallback, 'expected CLAUDE_CONFIG_DIR fallbacks to survive the install');
+      });
+    });
+  });
+}
