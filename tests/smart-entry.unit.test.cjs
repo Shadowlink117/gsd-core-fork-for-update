@@ -1245,3 +1245,176 @@ describe('#3099: unusable last_activity emits a diagnostic', () => {
       'dedup: second call on the same source must not re-emit');
   });
 });
+
+// ─── #4890: summaries must not mix global + milestone scopes ─────────────────
+//
+// Upstream #4890 (confirmed-bug): in a multi-milestone project the `planning`
+// summary (`buildSummary`) and the shared `executing` / `verify-pending`
+// `progressLine` render the project-GLOBAL current_phase against the
+// MILESTONE-scoped total — e.g. "Phase 13 of 5" for STATE current_phase 13
+// with a 5-phase milestone (11–15) of which 2 are done. The fix renders the
+// milestone-relative position ("Phase 3 of 5") when the scopes disagree and
+// leaves single-milestone rendering byte-identical. classify() is untouched.
+//
+// FAIL-FIRST contract: the three `multi-milestone …` tests FAIL on pre-fix
+// code (which renders "Phase 13 of 5"). The single-milestone + null guards
+// PASS pre-fix and pin what Task 2 must not disturb.
+
+describe('#4890 — milestone-relative summaries (no global/milestone scope mixing)', () => {
+  afterEach(removeAll);
+
+  /**
+   * #4890 repro ROADMAP: active milestone v1.3 holding 5 phases (11–15), 2
+   * checked. Mirrors the `roadmapWithProgress` shape the #2427 block pins
+   * (canonical Phase / Plans Complete / Status / Completed columns under a
+   * `## Progress` heading) so deriveProgressFromRoadmap yields total 5,
+   * completed 2.
+   */
+  function reproRoadmap() {
+    return [
+      '# Roadmap',
+      '',
+      '## Milestone v1.3',
+      '',
+      '## Progress',
+      '',
+      '| Phase | Plans Complete | Status | Completed |',
+      '|-------|----------------|--------|-----------|',
+      '| 11 | 1/1 | Complete | 2026-01-01 |',
+      '| 12 | 1/1 | Complete | 2026-01-02 |',
+      '| 13 | 0/1 | In Progress |  |',
+      '| 14 | 0/1 | In Progress |  |',
+      '| 15 | 0/1 | In Progress |  |',
+    ].join('\n') + '\n';
+  }
+
+  /** #4890 repro STATE: GLOBAL current_phase 13, milestone-scoped progress 5/40%. */
+  function reproState(status) {
+    return state({ status, total_phases: 5, current_phase: 13, progress: 40 });
+  }
+
+  /**
+   * Milestone-relative position every candidate derivation agrees on for the
+   * repro: 2 of 5 milestone phases complete and global phase 13 is the next
+   * undone one, i.e. 3rd in its 11–15 window (13 − 11 + 1 = completed + 1 = 3).
+   * Accepts "Phase 3 of 5" with or without a Task-2 "(v…)" milestone suffix —
+   * but a suffix, if present, must be the ROADMAP milestone version (v1.3),
+   * never prose-parsed (plan Review Focus).
+   */
+  function assertMilestoneRelative(summary, situation) {
+    assert.ok(!/Phase 13 of 5/.test(summary),
+      `${situation}: must not mix global phase 13 with milestone total 5. Got: ${summary}`);
+    const m = summary.match(/Phase 3 of 5(?: \(([^)]*)\))?/);
+    assert.ok(m,
+      `${situation}: must render milestone-relative "Phase 3 of 5" (optional "(v…)" suffix). Got: ${summary}`);
+    if (m[1] !== undefined) {
+      assert.equal(m[1], 'v1.3',
+        `${situation}: milestone suffix must be the ROADMAP milestone version, never prose-parsed. Got: (${m[1]})`);
+    }
+  }
+
+  test('repro fixture really mixes scopes (current 13, milestone total 5, 2 done)', () => {
+    const dir = track(makeProject({ state: reproState('planning'), roadmap: reproRoadmap() }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'planning');
+    assert.equal(result.signals.current_phase, '13', 'global phase index from STATE.md');
+    assert.equal(result.signals.total_phases, 5, 'milestone-scoped total from STATE.md progress');
+    assert.equal(result.signals.roadmap_total_phases, 5, 'milestone total from ROADMAP Progress table');
+    assert.equal(result.signals.roadmap_completed_phases, 2, 'milestone completed from ROADMAP Progress table');
+  });
+
+  test('multi-milestone planning summary renders milestone-relative (no "13 of 5")', () => {
+    const dir = track(makeProject({ state: reproState('planning'), roadmap: reproRoadmap() }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'planning');
+    assertMilestoneRelative(result.summary, 'planning');
+  });
+
+  test('multi-milestone executing progressLine renders milestone-relative (no "13 of 5")', () => {
+    const dir = track(makeProject({ state: reproState('executing'), roadmap: reproRoadmap() }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'executing');
+    assertMilestoneRelative(result.summary, 'executing');
+  });
+
+  test('multi-milestone verify-pending progressLine renders milestone-relative (no "13 of 5")', () => {
+    const dir = track(makeProject({ state: reproState('verifying'), roadmap: reproRoadmap() }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-pending');
+    assertMilestoneRelative(result.summary, 'verify-pending');
+  });
+
+  // Single-milestone guards (scopes coincide — rendering UNCHANGED, exact pins
+  // so a Task-2 disagree-branch misfire is caught). These PASS pre-fix.
+
+  /** Coincide-scope ROADMAP: milestone holds phases 1–5, 2 done. */
+  function singleMilestoneRoadmap() {
+    return [
+      '# Roadmap',
+      '',
+      '## Milestone v1.0',
+      '',
+      '## Progress',
+      '',
+      '| Phase | Plans Complete | Status | Completed |',
+      '|-------|----------------|--------|-----------|',
+      '| 01 | 1/1 | Complete | 2026-01-01 |',
+      '| 02 | 1/1 | Complete | 2026-01-02 |',
+      '| 03 | 0/1 | In Progress |  |',
+      '| 04 | 0/1 | In Progress |  |',
+      '| 05 | 0/1 | In Progress |  |',
+    ].join('\n') + '\n';
+  }
+
+  test('single-milestone planning rendering is unchanged', () => {
+    const dir = track(makeProject({
+      state: state({ status: 'planning', total_phases: 5, current_phase: 2 }),
+      roadmap: singleMilestoneRoadmap(),
+    }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'planning');
+    assert.equal(result.summary, 'Phase 2 of 5 — needs a plan');
+  });
+
+  test('single-milestone executing rendering is unchanged', () => {
+    const dir = track(makeProject({
+      state: state({ status: 'executing', total_phases: 5, current_phase: 2, progress: 60 }),
+      roadmap: singleMilestoneRoadmap(),
+    }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'executing');
+    assert.equal(result.summary, 'Phase 2 of 5 · 60% · executing');
+  });
+
+  test('single-milestone verify-pending rendering is unchanged', () => {
+    const dir = track(makeProject({
+      state: state({ status: 'verifying', total_phases: 5, current_phase: 2, progress: 40 }),
+      roadmap: singleMilestoneRoadmap(),
+    }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'verify-pending');
+    assert.equal(result.summary, 'Phase 2 of 5 · 40% · ready to verify');
+  });
+
+  // Null-field guards (`?? '?'` handling preserved). These PASS pre-fix.
+
+  test('planning with unknown current phase keeps the "?" placeholder', () => {
+    const dir = track(makeProject({
+      state: state({ status: 'planning', total_phases: 5 }),
+      roadmap: true, // empty roadmap — legacy path, no Progress table
+    }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'planning');
+    assert.equal(result.summary, 'Phase ? of 5 — needs a plan');
+  });
+
+  test('executing with unknown current phase omits the Phase part without crashing', () => {
+    const dir = track(makeProject({
+      state: state({ status: 'executing', total_phases: 5, progress: 60 }),
+      roadmap: true, // empty roadmap — legacy path, no Progress table
+    }));
+    const result = classifyProject(dir);
+    assert.equal(result.situation, 'executing');
+    assert.equal(result.summary, '60% · executing');
+  });
+});
