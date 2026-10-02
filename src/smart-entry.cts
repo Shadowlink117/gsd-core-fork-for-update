@@ -48,13 +48,18 @@ import frontmatter = require('./frontmatter.cjs');
 const { extractFrontmatter, frontmatterBlock } = frontmatter;
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- phase-lifecycle.cjs is an export= CommonJS module
 import phaseLifecycle = require('./phase-lifecycle.cjs');
-const { deriveProgressFromRoadmap } = phaseLifecycle;
+const { deriveProgressFromRoadmap, locateProgressTable } = phaseLifecycle;
+// #4890: the active-milestone window + identity owners for milestone-relative
+// summaries (rendering-only; classify() never consumes these).
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- roadmap-parser.cjs is an export= CommonJS module
+import roadmapParser = require('./roadmap-parser.cjs');
+const { extractCurrentMilestone, getMilestoneInfo, scanMilestonePhaseIds } = roadmapParser;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import stateDocument = require('./state-document.cjs');
 const { stateFieldValue } = stateDocument;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseId = require('./phase-id.cjs');
-const { comparePhaseNum, extractPhaseToken, matchPhaseDirs, normalizePhaseName, parsePhaseFromProse, stripProjectCodePrefix } = phaseId;
+const { comparePhaseNum, extractPhaseToken, isSentinelPhaseId, matchPhaseDirs, normalizePhaseName, parsePhaseFromProse, stripProjectCodePrefix } = phaseId;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import stateMod = require('./state.cjs');
 const { readStateHeadFreshness } = stateMod;
@@ -115,6 +120,19 @@ export interface SmartEntrySignals {
    */
   roadmap_total_phases: number | null;
   roadmap_completed_phases: number | null;
+  /**
+   * #4890: active-milestone identity + position for scope-aware summaries.
+   * `milestone_version` is sourced ONLY from the existing milestone-identity
+   * owner (`getMilestoneInfo`, i.e. STATE.md `milestone:` anchored to ROADMAP
+   * headings) — never parsed from prose. Null when unresolvable, in which
+   * case the milestone-relative label renders bare (`Phase 3 of 5`).
+   * `milestone_relative_phase` is the 1-based position of `current_phase`
+   * inside the active milestone's phase window (null when unknown or outside
+   * the window — the legacy global rendering then applies byte-identically).
+   * Rendering-only: classify() never consumes either field.
+   */
+  milestone_version: string | null;
+  milestone_relative_phase: number | null;
   /**
    * Commits between STATE.md's recorded `state_head` and HEAD (#2573). Null
    * when unknown — no stamp, no git, or an unresolvable commit.
@@ -425,6 +443,8 @@ export function detectSignals(cwd: string, now: () => number = Date.now): SmartE
     stale_activity: false,
     roadmap_total_phases: null,
     roadmap_completed_phases: null,
+    milestone_version: null,
+    milestone_relative_phase: null,
     // No STATE.md (or unreadable) → no stamp to compare. Unknown, not fresh.
     state_commits_behind: null,
     state_commit_stale: null,
@@ -508,14 +528,57 @@ export function detectSignals(cwd: string, now: () => number = Date.now): SmartE
   // Progress table — isComplete falls back to the legacy comparison in that case.
   let roadmapTotalPhases: number | null = null;
   let roadmapCompletedPhases: number | null = null;
+  // #4890: milestone-window membership (controller ruling 2) + milestone label
+  // (ruling 1). Both best-effort: any failure leaves both null and the pre-fix
+  // rendering applies byte-identically (single-milestone + null guards pin it).
+  let milestoneVersion: string | null = null;
+  let milestoneRelativePhase: number | null = null;
   if (hasRoadmap) {
+    let roadmapContent: string | null = null;
     try {
-      const roadmapContent = fs.readFileSync(paths.roadmap, 'utf8');
-      const derived = deriveProgressFromRoadmap(roadmapContent);
-      roadmapTotalPhases = derived.totalPhases;
-      roadmapCompletedPhases = derived.completedPhases;
+      roadmapContent = fs.readFileSync(paths.roadmap, 'utf8');
     } catch {
       /* ROADMAP.md unreadable — leave null; isComplete falls back to legacy. */
+    }
+    if (roadmapContent !== null) {
+      try {
+        const derived = deriveProgressFromRoadmap(roadmapContent);
+        roadmapTotalPhases = derived.totalPhases;
+        roadmapCompletedPhases = derived.completedPhases;
+      } catch {
+        /* Unparseable Progress table — leave null; isComplete falls back to legacy. */
+      }
+      try {
+        const window = extractCurrentMilestone(roadmapContent, cwd);
+        // Membership sources (union): declared phase headings/bullets/tables
+        // plus the Progress-table `Phase` column via its single owner
+        // (`locateProgressTable` — the SAME table deriveProgressFromRoadmap
+        // counts from), scoped to the active window. The union matters: the
+        // #4890/#2427 fixtures declare phases ONLY via the Progress table (no
+        // `### Phase N` headings), where the heading scan alone resolves
+        // empty; other house styles may lack a Progress table. The row filter
+        // mirrors deriveProgressFromRoadmap's data-row predicate exactly.
+        const windowIds = new Set<string>(scanMilestonePhaseIds(window));
+        const progressTable = locateProgressTable(window);
+        if (progressTable) {
+          for (const row of progressTable.rows) {
+            const id = (row['Phase'] ?? '').trim();
+            if (/^\d/.test(id) && !isSentinelPhaseId(id)) windowIds.add(id);
+          }
+        }
+        const sorted = [...windowIds].sort(comparePhaseNum);
+        const currentToken = phaseTokenFromState(currentPhaseRaw);
+        const idx =
+          currentToken === null
+            ? -1
+            : sorted.findIndex((id) => comparePhaseNum(id, currentToken) === 0);
+        if (idx >= 0) {
+          milestoneRelativePhase = idx + 1;
+          milestoneVersion = getMilestoneInfo(cwd).value?.version ?? null;
+        }
+      } catch {
+        /* Window unresolvable — legacy rendering. */
+      }
     }
   }
 
@@ -541,6 +604,8 @@ export function detectSignals(cwd: string, now: () => number = Date.now): SmartE
     stale_activity: staleActivity,
     roadmap_total_phases: roadmapTotalPhases,
     roadmap_completed_phases: roadmapCompletedPhases,
+    milestone_version: milestoneVersion,
+    milestone_relative_phase: milestoneRelativePhase,
     state_commits_behind: freshness.commits_behind,
     state_commit_stale: freshness.commit_stale,
   };
@@ -732,6 +797,37 @@ export function actionsFor(situation: Situation, s: SmartEntrySignals): SmartEnt
 
 // ─── Summary line ─────────────────────────────────────────────────────────────
 
+/**
+ * #4890: milestone-relative "Phase P of N" label, or null when the legacy
+ * global rendering applies (unknown current phase, current phase outside the
+ * active milestone window, or no milestone denominator — callers fall back to
+ * the pre-fix rendering byte-identically).
+ *
+ * The disagree-branch keys off milestone-window membership (controller ruling
+ * 2): `milestone_relative_phase` is set in detectSignals exactly when the
+ * global `current_phase` is a member of the active milestone's phase window —
+ * never off a bare `current > total` comparison, which cannot tell a
+ * numerically-coinciding position (global 3 vs milestone-3rd) from a real
+ * coincidence of scopes.
+ */
+function milestonePhaseLabel(s: SmartEntrySignals): string | null {
+  if (s.current_phase === null || s.milestone_relative_phase === null) return null;
+  const total = s.roadmap_total_phases ?? s.total_phases;
+  if (total === null) return null;
+  const label = `Phase ${s.milestone_relative_phase} of ${total}`;
+  // Milestone suffix (controller ruling 1): sourced ONLY from the payload's
+  // existing milestone identity (`milestone_version`, via getMilestoneInfo) —
+  // never parsed from prose; bare when unresolvable. Appended only when it
+  // disambiguates, i.e. the milestone-relative position differs from the
+  // global index: when the scopes coincide (single-milestone) the bare label
+  // already renders exactly like the legacy string, so no suffix keeps that
+  // rendering byte-identical.
+  if (s.milestone_version !== null && comparePhaseNum(s.current_phase, s.milestone_relative_phase) !== 0) {
+    return `${label} (${s.milestone_version})`;
+  }
+  return label;
+}
+
 function buildSummary(situation: Situation, s: SmartEntrySignals): string {
   switch (situation) {
     case 'no-project':
@@ -745,7 +841,7 @@ function buildSummary(situation: Situation, s: SmartEntrySignals): string {
     case 'needs-first-phase':
       return 'Project initialized — plan your first phase';
     case 'planning':
-      return `Phase ${s.current_phase ?? '?'} of ${s.total_phases ?? '?'} — needs a plan`;
+      return `${milestonePhaseLabel(s) ?? `Phase ${s.current_phase ?? '?'} of ${s.total_phases ?? '?'}`} — needs a plan`;
     case 'executing':
       return progressLine('executing', s);
     case 'verify-pending':
@@ -762,7 +858,12 @@ function buildSummary(situation: Situation, s: SmartEntrySignals): string {
 
 function progressLine(tail: string, s: SmartEntrySignals): string {
   const parts: string[] = [];
-  if (s.current_phase !== null && s.total_phases !== null) {
+  // #4890: shared by `executing` + `verify-pending` — both render fixed via
+  // the one milestone-relative label; null falls back to the pre-fix shape.
+  const label = milestonePhaseLabel(s);
+  if (label !== null) {
+    parts.push(label);
+  } else if (s.current_phase !== null && s.total_phases !== null) {
     parts.push(`Phase ${s.current_phase} of ${s.total_phases}`);
   } else if (s.current_phase !== null) {
     parts.push(`Phase ${s.current_phase}`);
