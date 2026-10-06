@@ -134,7 +134,8 @@
       "bakesStaticAgentModel": true,
       "bakedAgentFileExtensions": [
         ".md"
-      ]
+      ],
+      "rewritesClaudeRefsOnInstall": true
     }
   },
   "reviewer": {

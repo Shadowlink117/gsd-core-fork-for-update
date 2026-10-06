@@ -1954,6 +1954,7 @@ const KNOWN_HOST_BEHAVIORS = new Set([
   'restoreAtRefTildeInSpecTree',
   'retiredArtifacts',
   'rewriteClaudeAtIncludes',
+  'rewritesClaudeRefsOnInstall',
   'settingsFileByScope',
   'sharedHooksDirName',
   'skillFrontmatterVersion',

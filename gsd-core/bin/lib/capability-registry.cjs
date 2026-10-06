@@ -3024,7 +3024,8 @@ const capabilities = {
         "bakesStaticAgentModel": true,
         "bakedAgentFileExtensions": [
           ".md"
-        ]
+        ],
+        "rewritesClaudeRefsOnInstall": true
       }
     },
     "reviewer": {
@@ -7300,7 +7301,8 @@ const runtimes = {
         "bakesStaticAgentModel": true,
         "bakedAgentFileExtensions": [
           ".md"
-        ]
+        ],
+        "rewritesClaudeRefsOnInstall": true
       }
     },
     "reviewer": {

@@ -12380,7 +12380,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       // `${_GSD_RUNTIME_ROOT}/.claude/` probes, and CHANGELOG.md are
       // deliberately untouched.
       let opencodeRewroteFiles = 0;
-      if (runtime === 'opencode') {
+      if (hostBehaviorsFor(runtime).rewritesClaudeRefsOnInstall) {
         for (const relPath of manifestFiles) {
           const fileName = path.basename(relPath);
           if (!(fileName.endsWith('.md') || fileName.endsWith('.toml'))) continue;
@@ -12422,7 +12422,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
         // ~/$HOME-anchored refs) with the same (?<!:-) fallback guard, so
         // surviving `${VAR:-…}` shell defaults never trip it. Other runtimes
         // keep the legacy pattern (their conversions are out of scope here).
-        const leakRe = runtime === 'opencode'
+        const leakRe = hostBehaviorsFor(runtime).rewritesClaudeRefsOnInstall
           ? /--claude --(?:local|global)|\.claude\/skills\/|@(?:~|\$HOME|\.)\/\.claude\/|\.\/\.claude\/|(?<!:-)(?:~|\$HOME)\/\.claude\b/g
           : /(?:~|\$HOME)\/\.claude\b/g;
         const matches = content.match(leakRe);
